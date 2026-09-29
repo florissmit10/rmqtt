@@ -1,0 +1,269 @@
+# Default values for the rmqtt chart.
+#
+# Secrets (ACL passwords, HTTP API bearer token) do NOT belong in this file.
+# Put them in values-secrets.yaml (see values-secrets.example.yaml) or point the
+# chart at existing Secrets:
+#
+#   helm install mqtt ./charts/rmqtt -f my-values.yaml -f values-secrets.yaml
+
+nameOverride: ""
+fullnameOverride: ""
+
+image:
+  # The upstream Dockerfile.amd64 layout is assumed: binary at /app/rmqtt/rmqtt-bin/rmqttd,
+  # busybox (sh, awk, wget) available for the init container and readiness probe.
+  repository: rmqtt/rmqtt
+  # Defaults to .Chart.AppVersion when empty.
+  tag: ""
+  pullPolicy: IfNotPresent
+  binary: /app/rmqtt/rmqtt-bin/rmqttd
+
+imagePullSecrets: []
+
+# Number of Raft nodes. Node ids are ordinal+1 and the peer lists are generated from
+# this value, so changing it requires a full rollout of every pod (all nodes must agree
+# on the peer list). Do not autoscale.
+replicaCount: 3
+
+# Reads RMQTT_* / RMQTT_PLUGIN_* env vars as config overrides; Kubernetes service links
+# would inject variables like RMQTT_SERVICE_HOST, so they are disabled.
+enableServiceLinks: false
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+  automountServiceAccountToken: false
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65534
+  runAsGroup: 65534
+  fsGroup: 65534
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+resources: {}
+  # requests:
+  #   cpu: 250m
+  #   memory: 256Mi
+  # limits:
+  #   memory: 1Gi
+
+nodeSelector: {}
+tolerations: []
+topologySpreadConstraints: []
+
+# Soft anti-affinity on kubernetes.io/hostname is applied unless `affinity` is set.
+affinity: {}
+podAntiAffinity:
+  enabled: true
+  weight: 100
+  topologyKey: kubernetes.io/hostname
+
+terminationGracePeriodSeconds: 30
+priorityClassName: ""
+
+podDisruptionBudget:
+  enabled: true
+  maxUnavailable: 1
+
+# Extra env vars for the broker container, e.g. RMQTT_PLUGIN_<NAME>_<KEY> overrides.
+extraEnv: []
+
+##--------------------------------------------------------------------
+## Broker configuration (rendered into rmqtt.toml)
+##--------------------------------------------------------------------
+broker:
+  log:
+    level: info
+  task:
+    execWorkers: 2000
+    execQueueMax: 300000
+  mqtt:
+    maxSessions: 0
+  # Plugins started at boot. rmqtt-cluster-raft and rmqtt-acl are always added.
+  plugins:
+    - rmqtt-retainer
+    - rmqtt-shared-subscription
+    - rmqtt-http-api
+  # Extra plugin config files: { "rmqtt-sys-topic": "<toml content>" }. Do not put secrets here.
+  extraPluginConfigs: {}
+  # Raw TOML appended to rmqtt.toml (escape hatch).
+  extraConfig: ""
+
+  listeners:
+    # Settings shared by all external listeners (tcp 1883, ws 8080, tls 8883, wss 8443).
+    maxConnections: 1024000
+    maxHandshakingLimit: 500
+    handshakeTimeout: 30s
+    maxPacketSize: 1MB
+    maxInflight: 16
+    maxMqueueLen: 1000
+    mqueueRateLimit: "1000,1s"
+    sessionExpiryInterval: 2h
+    messageExpiryInterval: 5m
+    # Expect a PROXY protocol v1/v2 header on every external listener. Only enable
+    # when EVERY path to the broker goes through a proxy/LB that sends it.
+    proxyProtocol: false
+    proxyProtocolTimeout: 5s
+    tcp:
+      enabled: true
+      port: 1883
+    ws:
+      enabled: true
+      port: 8080
+    # tls/wss are only enabled when tls.existingSecret is set.
+    tls:
+      port: 8883
+    wss:
+      port: 8443
+    # Anonymous internal listener. Never exposed through a Service; the NetworkPolicy
+    # restricts it to broker pods.
+    internal:
+      enabled: true
+      port: 11883
+
+tls:
+  # Secret of type kubernetes.io/tls (tls.crt, tls.key; optionally ca.crt).
+  # When set, MQTTS (8883) and WSS (8443) listeners are enabled.
+  existingSecret: ""
+  # Require client certificates signed by ca.crt from the same Secret.
+  mutualTls: false
+
+##--------------------------------------------------------------------
+## Raft cluster (rendered into rmqtt-cluster-raft.toml)
+##--------------------------------------------------------------------
+cluster:
+  grpcPort: 5363
+  raftPort: 6003
+  # Node 1 is the designated bootstrap leader. With leader_id = 0 a node that
+  # cannot reach any peer elects itself leader of its own cluster (split brain).
+  leaderId: 1
+  workerThreads: 6
+  nodeGrpcClientTimeout: 10s
+  tryLockTimeout: 10s
+  # Exit the process when the raft cluster is unavailable for
+  # maxContinuousUnavailableCount * unavailableCheckInterval; kubelet restarts it and
+  # it rejoins the current leader.
+  health:
+    exitOnNodeUnavailable: true
+    maxContinuousUnavailableCount: 10
+    unavailableCheckInterval: 2s
+  # Raw TOML appended to rmqtt-cluster-raft.toml.
+  extraConfig: ""
+
+##--------------------------------------------------------------------
+## HTTP API (rmqtt-http-api)
+##--------------------------------------------------------------------
+httpApi:
+  port: 6060
+  requestLog: false
+  bearerToken:
+    # Require `Authorization: Bearer <token>` on every API call (including the
+    # readiness probe, which reads the token from the same env var).
+    # The token comes from values-secrets.yaml (httpApiBearerToken) or existingSecret.
+    enabled: true
+    existingSecret: ""
+    existingSecretKey: token
+  # Raw TOML appended to rmqtt-http-api.toml.
+  extraConfig: ""
+
+##--------------------------------------------------------------------
+## ACL / users (rmqtt-acl)
+##--------------------------------------------------------------------
+# Passwords are NOT set here. Each user's password is read from the password Secret
+# under the key `passwordKey` (defaults to the username) and substituted into
+# rmqtt-acl.toml by an init container.
+acl:
+  disconnectIfPubRejected: true
+  # Secret with one key per user (key = passwordKey, value = plaintext password).
+  # Leave empty to have the chart create it from `aclPasswords` in values-secrets.yaml.
+  existingSecret: ""
+  users: []
+    # - username: alice
+    #   # passwordKey: alice        # Secret key; must match [-._a-zA-Z0-9]+
+    #   superuser: false          # superusers skip publish/subscribe ACL checks
+    #   permissions:
+    #     - action: pubsub        # publish | subscribe | pubsub | all
+    #       topics: ["devices/alice/#"]
+    #     - access: deny          # allow (default) | deny
+    #       action: subscribe
+    #       topics: [{ eq: "#" }] # exact match instead of a topic filter
+    # - username: dashboard
+    #   superuser: true
+  # Raw rmqtt-acl rules (TOML inline arrays) inserted after the user rules and before
+  # the final rule, e.g. '["allow", "all", "subscribe", ["public/#"]]'.
+  # Rules containing "password" are rejected: passwords only come from the Secret.
+  extraRules: []
+  # Final catch-all rule: "deny" (fail closed) or "allow".
+  finalRule: deny
+
+##--------------------------------------------------------------------
+## Services
+##--------------------------------------------------------------------
+service:
+  # Client-facing MQTT service (1883/8080, plus 8883/8443 with TLS).
+  type: ClusterIP
+  annotations: {}
+  labels: {}
+  loadBalancerIP: ""
+  loadBalancerSourceRanges: []
+  loadBalancerClass: ""
+  externalTrafficPolicy: ""
+  sessionAffinity: None
+  nodePorts:
+    mqtt: ""
+    ws: ""
+    mqtts: ""
+    wss: ""
+
+apiService:
+  type: ClusterIP
+  annotations: {}
+
+##--------------------------------------------------------------------
+## Probes
+##--------------------------------------------------------------------
+# startup + liveness: TCP connect on the MQTT port (no credentials needed).
+# readiness: GET /api/v1/health/check/<own node id> via busybox wget in the pod
+# (exec, because the node id and bearer token differ per pod / live in a Secret).
+startupProbe:
+  enabled: true
+  periodSeconds: 5
+  failureThreshold: 60
+  timeoutSeconds: 3
+livenessProbe:
+  enabled: true
+  periodSeconds: 10
+  failureThreshold: 6
+  timeoutSeconds: 3
+readinessProbe:
+  enabled: true
+  periodSeconds: 10
+  failureThreshold: 3
+  timeoutSeconds: 5
+
+##--------------------------------------------------------------------
+## NetworkPolicy
+##--------------------------------------------------------------------
+# gRPC (5363) and raft (6003) have no TLS/auth: they are only reachable from broker pods,
+# as is the anonymous internal listener. The HTTP API is reachable from the release
+# namespace plus `apiFrom`; MQTT ports from `clientFrom` (empty = anywhere).
+networkPolicy:
+  enabled: true
+  allowApiFromNamespace: true
+  apiFrom: []
+    # - namespaceSelector:
+    #     matchLabels:
+    #       kubernetes.io/metadata.name: monitoring
+  clientFrom: []

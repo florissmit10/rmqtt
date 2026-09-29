@@ -1,0 +1,14 @@
+apiVersion: v2
+name: rmqtt
+description: RMQTT MQTT broker as a Raft cluster (rmqtt-cluster-raft) with file-based ACL users (rmqtt-acl).
+type: application
+version: 0.1.0
+appVersion: "0.25.0"
+keywords:
+  - mqtt
+  - rmqtt
+  - broker
+  - raft
+home: https://github.com/rmqtt/rmqtt
+sources:
+  - https://github.com/rmqtt/rmqtt

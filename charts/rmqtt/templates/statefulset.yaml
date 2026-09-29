@@ -1,0 +1,237 @@
+{{- include "rmqtt.validate" . -}}
+{{- $l := .Values.broker.listeners -}}
+{{- $fullname := include "rmqtt.fullname" . -}}
+{{- $tokenEnabled := .Values.httpApi.bearerToken.enabled -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $fullname }}
+  labels:
+    {{- include "rmqtt.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  serviceName: {{ include "rmqtt.headlessServiceName" . }}
+  # Node 1 (ordinal 0) bootstraps the raft cluster; the others join it in order.
+  podManagementPolicy: OrderedReady
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      {{- include "rmqtt.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "rmqtt.selectorLabels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Config and ACL changes roll the pods (rmqtt-acl reload is per node via the HTTP API).
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/acl: {{ include (print $.Template.BasePath "/configmap-acl.yaml") . | sha256sum }}
+        checksum/secrets: {{ include (print $.Template.BasePath "/secrets.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "rmqtt.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      enableServiceLinks: {{ .Values.enableServiceLinks }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if .Values.affinity }}
+      affinity:
+        {{- toYaml .Values.affinity | nindent 8 }}
+      {{- else if .Values.podAntiAffinity.enabled }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: {{ .Values.podAntiAffinity.weight }}
+              podAffinityTerm:
+                topologyKey: {{ .Values.podAntiAffinity.topologyKey }}
+                labelSelector:
+                  matchLabels:
+                    {{- include "rmqtt.selectorLabels" . | nindent 20 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        # Assembles /etc/rmqtt from the ConfigMaps and substitutes the ACL passwords
+        # from the password Secret. The Secret is only mounted in this container.
+        - name: render-config
+          image: {{ include "rmqtt.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              mkdir -p /etc/rmqtt/plugins
+              cp /config-src/rmqtt.toml /etc/rmqtt/rmqtt.toml
+              for f in /config-src/*.toml; do
+                [ "$(basename "$f")" = rmqtt.toml ] || cp "$f" /etc/rmqtt/plugins/
+              done
+              sh /acl-src/render-acl.sh /acl-src/rmqtt-acl.toml.tpl /etc/rmqtt/plugins/rmqtt-acl.toml /acl-passwords
+              echo "rendered: $(ls /etc/rmqtt /etc/rmqtt/plugins | tr '\n' ' ')"
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/rmqtt
+            - name: config-src
+              mountPath: /config-src
+              readOnly: true
+            - name: acl-src
+              mountPath: /acl-src
+              readOnly: true
+            - name: acl-passwords
+              mountPath: /acl-passwords
+              readOnly: true
+      containers:
+        - name: rmqtt
+          image: {{ include "rmqtt.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          workingDir: /etc/rmqtt
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              ID=$(( ${POD_NAME##*-} + 1 ))
+              exec {{ .Values.image.binary }} -f /etc/rmqtt/rmqtt.toml --id "$ID" \
+                {{ include "rmqtt.peerArgs" (list . "node-grpc-addrs" .Values.cluster.grpcPort) }} \
+                {{ include "rmqtt.peerArgs" (list . "raft-peer-addrs" .Values.cluster.raftPort) }}
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            {{- if $tokenEnabled }}
+            - name: RMQTT_PLUGIN_RMQTT_HTTP_API_HTTP_BEARER_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "rmqtt.apiTokenSecretName" . }}
+                  key: {{ include "rmqtt.apiTokenSecretKey" . }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          ports:
+            {{- if $l.tcp.enabled }}
+            - name: mqtt
+              containerPort: {{ $l.tcp.port }}
+            {{- end }}
+            {{- if $l.ws.enabled }}
+            - name: ws
+              containerPort: {{ $l.ws.port }}
+            {{- end }}
+            {{- if .Values.tls.existingSecret }}
+            - name: mqtts
+              containerPort: {{ $l.tls.port }}
+            - name: wss
+              containerPort: {{ $l.wss.port }}
+            {{- end }}
+            {{- if $l.internal.enabled }}
+            - name: mqtt-internal
+              containerPort: {{ $l.internal.port }}
+            {{- end }}
+            - name: http-api
+              containerPort: {{ .Values.httpApi.port }}
+            - name: grpc
+              containerPort: {{ .Values.cluster.grpcPort }}
+            - name: raft
+              containerPort: {{ .Values.cluster.raftPort }}
+          {{- $probePort := ternary "mqtt" "http-api" $l.tcp.enabled }}
+          {{- with .Values.startupProbe }}
+          {{- if .enabled }}
+          startupProbe:
+            tcpSocket:
+              port: {{ $probePort }}
+            periodSeconds: {{ .periodSeconds }}
+            failureThreshold: {{ .failureThreshold }}
+            timeoutSeconds: {{ .timeoutSeconds }}
+          {{- end }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          {{- if .enabled }}
+          livenessProbe:
+            tcpSocket:
+              port: {{ $probePort }}
+            periodSeconds: {{ .periodSeconds }}
+            failureThreshold: {{ .failureThreshold }}
+            timeoutSeconds: {{ .timeoutSeconds }}
+          {{- end }}
+          {{- end }}
+          {{- if .Values.readinessProbe.enabled }}
+          readinessProbe:
+            {{- $auth := ternary " --header \"Authorization: Bearer ${RMQTT_PLUGIN_RMQTT_HTTP_API_HTTP_BEARER_TOKEN}\"" "" $tokenEnabled }}
+            exec:
+              command:
+                - /bin/sh
+                - -c
+                - {{ printf "wget -q -T %d -O /dev/null%s \"http://127.0.0.1:%d/api/v1/health/check/$(( ${POD_NAME##*-} + 1 ))\"" (int .Values.readinessProbe.timeoutSeconds) $auth (int .Values.httpApi.port) | quote }}
+            periodSeconds: {{ .Values.readinessProbe.periodSeconds }}
+            failureThreshold: {{ .Values.readinessProbe.failureThreshold }}
+            timeoutSeconds: {{ add1 (int .Values.readinessProbe.timeoutSeconds) }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/rmqtt
+              readOnly: true
+            - name: data
+              mountPath: /var/log/rmqtt
+            - name: tmp
+              mountPath: /tmp
+            {{- if .Values.tls.existingSecret }}
+            - name: tls
+              mountPath: /etc/rmqtt-tls
+              readOnly: true
+            {{- end }}
+      volumes:
+        # Rendered config incl. ACL passwords: memory-backed, never written to node disk.
+        - name: config
+          emptyDir:
+            medium: Memory
+            sizeLimit: 4Mi
+        - name: config-src
+          configMap:
+            name: {{ $fullname }}
+        - name: acl-src
+          configMap:
+            name: {{ $fullname }}-acl
+        - name: acl-passwords
+          secret:
+            secretName: {{ include "rmqtt.aclSecretName" . }}
+            defaultMode: 0440
+        # Upstream default paths for caches (retainer/session storage when set to sled).
+        # Nothing is persisted across restarts: raft state is in-memory by design.
+        - name: data
+          emptyDir: {}
+        - name: tmp
+          emptyDir: {}
+        {{- if .Values.tls.existingSecret }}
+        - name: tls
+          secret:
+            secretName: {{ .Values.tls.existingSecret }}
+            defaultMode: 0440
+        {{- end }}

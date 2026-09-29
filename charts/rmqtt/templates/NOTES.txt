@@ -1,0 +1,35 @@
+RMQTT {{ .Chart.AppVersion }}: {{ .Values.replicaCount }}-node Raft cluster "{{ include "rmqtt.fullname" . }}" in namespace {{ .Release.Namespace }}.
+
+MQTT endpoint (Service {{ include "rmqtt.fullname" . }}, type {{ .Values.service.type }}):
+{{- if .Values.broker.listeners.tcp.enabled }}
+  mqtt://{{ include "rmqtt.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.broker.listeners.tcp.port }}
+{{- end }}
+{{- if .Values.broker.listeners.ws.enabled }}
+  ws://{{ include "rmqtt.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.broker.listeners.ws.port }}
+{{- end }}
+{{- if .Values.tls.existingSecret }}
+  mqtts://{{ include "rmqtt.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.broker.listeners.tls.port }}
+  wss://{{ include "rmqtt.fullname" . }}.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.broker.listeners.wss.port }}
+{{- end }}
+
+Authentication: rmqtt-acl, anonymous clients rejected, final rule ["{{ .Values.acl.finalRule }}", "all"].
+{{- if not .Values.acl.users }}
+  WARNING: acl.users is empty, so no client can connect. Add users to your values and
+  their passwords to values-secrets.yaml (see values-secrets.example.yaml).
+{{- else }}
+  Users: {{ range $i, $u := .Values.acl.users }}{{ if $i }}, {{ end }}{{ $u.username }}{{ end }}
+{{- end }}
+{{- if .Values.acl.existingSecret }}
+  Passwords are read from Secret "{{ .Values.acl.existingSecret }}". Pods do NOT restart
+  automatically when it changes:
+    kubectl -n {{ .Release.Namespace }} rollout restart statefulset/{{ include "rmqtt.fullname" . }}
+{{- end }}
+
+Cluster status:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "rmqtt.fullname" . }}-api {{ .Values.httpApi.port }}
+  curl {{ if .Values.httpApi.bearerToken.enabled }}-H "Authorization: Bearer $TOKEN" {{ end }}http://127.0.0.1:{{ .Values.httpApi.port }}/api/v1/health/check
+{{- if .Values.httpApi.bearerToken.enabled }}
+  TOKEN=$(kubectl -n {{ .Release.Namespace }} get secret {{ include "rmqtt.apiTokenSecretName" . }} -o jsonpath='{.data.{{ include "rmqtt.apiTokenSecretKey" . }}}' | base64 -d)
+{{- end }}
+
+replicaCount is part of every node's static peer list: changing it rolls all pods.

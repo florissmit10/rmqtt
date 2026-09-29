@@ -1,0 +1,82 @@
+{{- $placeholder := "@@ACL_PASSWORD:%s@@" -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "rmqtt.fullname" . }}-acl
+  labels:
+    {{- include "rmqtt.labels" . | nindent 4 }}
+data:
+  # ACL rules WITHOUT secrets. Each @@ACL_PASSWORD:<key>@@ placeholder is replaced by the
+  # init container with the value of <key> from the password Secret.
+  rmqtt-acl.toml.tpl: |
+    disconnect_if_pub_rejected = {{ .Values.acl.disconnectIfPubRejected }}
+
+    rules = [
+    {{- range .Values.acl.users }}
+      {{- $key := include "rmqtt.passwordKey" . }}
+      # user {{ .username | quote }}
+      ["allow", { user = {{ include "rmqtt.tomlString" .username }}, password = "{{ printf $placeholder $key }}", superuser = {{ .superuser | default false }} }, "connect"],
+      {{- $user := .username }}
+      {{- range .permissions }}
+      {{- $access := default "allow" .access }}
+      {{- if not (has $access (list "allow" "deny")) }}{{ fail (printf "acl.users[%s].permissions[].access must be allow or deny" $user) }}{{ end }}
+      {{- $action := default "pubsub" .action }}
+      {{- if not (has $action (list "publish" "subscribe" "pubsub" "all")) }}{{ fail (printf "acl.users[%s].permissions[].action must be publish, subscribe, pubsub or all" $user) }}{{ end }}
+      {{- if not .topics }}{{ fail (printf "acl.users[%s].permissions[].topics must not be empty" $user) }}{{ end }}
+      {{- $topics := list }}
+      {{- range .topics }}{{ $topics = append $topics (include "rmqtt.tomlTopic" .) }}{{ end }}
+      [{{ $access | quote }}, { user = {{ include "rmqtt.tomlString" $user }} }, {{ $action | quote }}, [{{ join ", " $topics }}]],
+      {{- end }}
+    {{- end }}
+    {{- range .Values.acl.extraRules }}
+      {{ . }},
+    {{- end }}
+      [{{ .Values.acl.finalRule | quote }}, "all"]
+    ]
+
+  # Substitutes @@ACL_PASSWORD:<key>@@ with the TOML-escaped contents of
+  # $PASSWORD_DIR/<key>. Fails on a missing/empty key or control characters.
+  render-acl.sh: |
+    #!/bin/sh
+    set -eu
+    src="$1"; dst="$2"; PASSWORD_DIR="$3"
+    tmp="$dst.tmp"
+    awk -v dir="$PASSWORD_DIR" '
+    function die(msg) { print "render-acl: " msg > "/dev/stderr"; failed = 1; exit 1 }
+    function esc(s,    out, i, c) {
+      out = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\\") out = out "\\\\"
+        else if (c == "\"") out = out "\\\""
+        else out = out c
+      }
+      return out
+    }
+    function password(key,    f, line, s, n, r) {
+      if (key !~ /^[-._a-zA-Z0-9]+$/) die("invalid password key: " key)
+      f = dir "/" key
+      s = ""; n = 0
+      while ((r = (getline line < f)) > 0) { s = (n++ ? s "\n" : "") line }
+      close(f)
+      if (r < 0) die("password for key \"" key "\" not found in " dir)
+      if (s == "") die("password for key \"" key "\" is empty")
+      if (s ~ /[\001-\037\177]/) die("password for key \"" key "\" contains control characters or newlines")
+      return esc(s)
+    }
+    {
+      out = ""; rest = $0
+      while ((i = index(rest, "@@ACL_PASSWORD:")) > 0) {
+        out = out substr(rest, 1, i - 1)
+        rest = substr(rest, i + 15)
+        j = index(rest, "@@")
+        if (j == 0) die("unterminated placeholder on line " NR)
+        out = out password(substr(rest, 1, j - 1))
+        rest = substr(rest, j + 2)
+      }
+      print out rest
+    }
+    END { if (failed) exit 1 }
+    ' "$src" > "$tmp" || { rm -f "$tmp"; exit 1; }
+    chmod 0400 "$tmp"
+    mv "$tmp" "$dst"

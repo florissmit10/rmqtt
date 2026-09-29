@@ -1,0 +1,68 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- $l := .Values.broker.listeners }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "rmqtt.fullname" . }}
+  labels:
+    {{- include "rmqtt.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "rmqtt.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+  ingress:
+    # Cluster-internal ports: gRPC and raft have no TLS/auth, the internal MQTT
+    # listener is anonymous. Only broker pods of this release may connect.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "rmqtt.selectorLabels" . | nindent 14 }}
+      ports:
+        - port: {{ .Values.cluster.grpcPort }}
+          protocol: TCP
+        - port: {{ .Values.cluster.raftPort }}
+          protocol: TCP
+        {{- if $l.internal.enabled }}
+        - port: {{ $l.internal.port }}
+          protocol: TCP
+        {{- end }}
+        - port: {{ .Values.httpApi.port }}
+          protocol: TCP
+    {{- if or .Values.networkPolicy.allowApiFromNamespace .Values.networkPolicy.apiFrom }}
+    # HTTP API
+    - from:
+        {{- if .Values.networkPolicy.allowApiFromNamespace }}
+        - podSelector: {}
+        {{- end }}
+        {{- with .Values.networkPolicy.apiFrom }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      ports:
+        - port: {{ .Values.httpApi.port }}
+          protocol: TCP
+    {{- end }}
+    {{- if or $l.tcp.enabled $l.ws.enabled .Values.tls.existingSecret }}
+    # MQTT client listeners
+    - ports:
+        {{- if $l.tcp.enabled }}
+        - port: {{ $l.tcp.port }}
+          protocol: TCP
+        {{- end }}
+        {{- if $l.ws.enabled }}
+        - port: {{ $l.ws.port }}
+          protocol: TCP
+        {{- end }}
+        {{- if .Values.tls.existingSecret }}
+        - port: {{ $l.tls.port }}
+          protocol: TCP
+        - port: {{ $l.wss.port }}
+          protocol: TCP
+        {{- end }}
+      {{- with .Values.networkPolicy.clientFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    {{- end }}
+{{- end }}

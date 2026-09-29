@@ -1,0 +1,104 @@
+{{- $l := .Values.broker.listeners -}}
+{{- $svc := .Values.service -}}
+# Headless service: stable per-pod DNS for gRPC/raft peers. Not-ready addresses are
+# published so booting nodes can find each other before they pass readiness.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rmqtt.headlessServiceName" . }}
+  labels:
+    {{- include "rmqtt.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "rmqtt.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: grpc
+      port: {{ .Values.cluster.grpcPort }}
+      targetPort: grpc
+    - name: raft
+      port: {{ .Values.cluster.raftPort }}
+      targetPort: raft
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rmqtt.fullname" . }}
+  labels:
+    {{- include "rmqtt.labels" . | nindent 4 }}
+    {{- with $svc.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $svc.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ $svc.type }}
+  {{- if and (eq $svc.type "LoadBalancer") $svc.loadBalancerIP }}
+  loadBalancerIP: {{ $svc.loadBalancerIP }}
+  {{- end }}
+  {{- if and (eq $svc.type "LoadBalancer") $svc.loadBalancerClass }}
+  loadBalancerClass: {{ $svc.loadBalancerClass }}
+  {{- end }}
+  {{- if and (eq $svc.type "LoadBalancer") $svc.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml $svc.loadBalancerSourceRanges | nindent 4 }}
+  {{- end }}
+  {{- if and (has $svc.type (list "LoadBalancer" "NodePort")) $svc.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ $svc.externalTrafficPolicy }}
+  {{- end }}
+  sessionAffinity: {{ $svc.sessionAffinity }}
+  selector:
+    {{- include "rmqtt.selectorLabels" . | nindent 4 }}
+  ports:
+    {{- if $l.tcp.enabled }}
+    - name: mqtt
+      port: {{ $l.tcp.port }}
+      targetPort: mqtt
+      {{- if and (has $svc.type (list "LoadBalancer" "NodePort")) $svc.nodePorts.mqtt }}
+      nodePort: {{ $svc.nodePorts.mqtt }}
+      {{- end }}
+    {{- end }}
+    {{- if $l.ws.enabled }}
+    - name: ws
+      port: {{ $l.ws.port }}
+      targetPort: ws
+      {{- if and (has $svc.type (list "LoadBalancer" "NodePort")) $svc.nodePorts.ws }}
+      nodePort: {{ $svc.nodePorts.ws }}
+      {{- end }}
+    {{- end }}
+    {{- if .Values.tls.existingSecret }}
+    - name: mqtts
+      port: {{ $l.tls.port }}
+      targetPort: mqtts
+      {{- if and (has $svc.type (list "LoadBalancer" "NodePort")) $svc.nodePorts.mqtts }}
+      nodePort: {{ $svc.nodePorts.mqtts }}
+      {{- end }}
+    - name: wss
+      port: {{ $l.wss.port }}
+      targetPort: wss
+      {{- if and (has $svc.type (list "LoadBalancer" "NodePort")) $svc.nodePorts.wss }}
+      nodePort: {{ $svc.nodePorts.wss }}
+      {{- end }}
+    {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rmqtt.fullname" . }}-api
+  labels:
+    {{- include "rmqtt.labels" . | nindent 4 }}
+  {{- with .Values.apiService.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  type: {{ .Values.apiService.type }}
+  selector:
+    {{- include "rmqtt.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http-api
+      port: {{ .Values.httpApi.port }}
+      targetPort: http-api
